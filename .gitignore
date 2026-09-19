@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+*.pt
+*.pth
+*.bin
+*.safetensors
+runs/
+checkpoints/
+data/private/
+.vscode/
+.idea/
