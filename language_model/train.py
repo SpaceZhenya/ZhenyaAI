@@ -12,17 +12,17 @@ from language_model.config import (
     create_project_directories,
 )
 from language_model.dataset import (
+    choose_context_length,
     create_data_loader,
+    get_tokenizer_vocab_size,
     prepare_token_data,
 )
 from language_model.model import ZhenyaLanguageModel
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BEST_CHECKPOINT_PATH = CHECKPOINTS_DIR / "best_model.pt"
 LAST_CHECKPOINT_PATH = CHECKPOINTS_DIR / "last_model.pt"
 
-VOCAB_SIZE = 8_000
 BATCH_SIZE = 2
 MAX_STEPS = 500
 LEARNING_RATE = 3e-4
@@ -46,7 +46,7 @@ def evaluate_loss(
 ) -> float:
     model.eval()
 
-    losses: list[float] = []
+    losses = []
 
     with torch.no_grad():
         for batch_index, (input_ids, targets) in enumerate(loader):
@@ -81,14 +81,24 @@ def save_checkpoint(
     validation_loss: float,
     config: ModelConfig,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     torch.save(
         {
             "step": step,
             "train_loss": train_loss,
             "validation_loss": validation_loss,
-            "model_config": config.__dict__,
+            "model_config": {
+                "vocab_size": config.vocab_size,
+                "context_length": config.context_length,
+                "embedding_dim": config.embedding_dim,
+                "num_layers": config.num_layers,
+                "num_heads": config.num_heads,
+                "dropout": config.dropout,
+            },
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         },
@@ -102,12 +112,21 @@ def main() -> None:
 
     create_project_directories()
 
-    print("Подготавливаем токены...")
+    print("Подготавливаем токены...\n")
 
     train_tokens, valid_tokens = prepare_token_data()
 
+    vocab_size = get_tokenizer_vocab_size()
+
+    context_length = choose_context_length(
+        train_tokens=train_tokens,
+        valid_tokens=valid_tokens,
+        requested_length=256,
+    )
+
     config = ModelConfig(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=vocab_size,
+        context_length=context_length,
     )
 
     training_config = TrainingConfig(
@@ -121,7 +140,7 @@ def main() -> None:
 
     device = get_device()
 
-    print(f"\nУстройство: {device}")
+    print(f"Устройство: {device}")
     print(f"Размер словаря: {config.vocab_size}")
     print(f"Длина контекста: {config.context_length}")
 
@@ -151,13 +170,20 @@ def main() -> None:
         f"Параметров модели: "
         f"{model.parameter_count():,}"
     )
-    print(f"Максимальное количество шагов: {MAX_STEPS}")
-    print("Начинаем обучение...\n")
+    print(
+        f"Максимальное количество шагов: "
+        f"{training_config.max_steps}"
+    )
+    print("\nНачинаем обучение...\n")
 
     train_iterator = iter(train_loader)
     best_validation_loss = float("inf")
+    last_validation_loss = float("inf")
 
-    for step in range(1, training_config.max_steps + 1):
+    for step in range(
+        1,
+        training_config.max_steps + 1,
+    ):
         try:
             input_ids, targets = next(train_iterator)
         except StopIteration:
@@ -167,7 +193,9 @@ def main() -> None:
         input_ids = input_ids.to(device)
         targets = targets.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(
+            set_to_none=True,
+        )
 
         _, loss = model(
             input_ids=input_ids,
@@ -175,7 +203,9 @@ def main() -> None:
         )
 
         if loss is None:
-            raise RuntimeError("Модель не вернула loss.")
+            raise RuntimeError(
+                "Модель не вернула значение loss."
+            )
 
         loss.backward()
 
@@ -186,21 +216,26 @@ def main() -> None:
 
         optimizer.step()
 
-        if step == 1 or step % EVAL_EVERY_STEPS == 0:
-            validation_loss = evaluate_loss(
+        should_evaluate = (
+            step == 1
+            or step % training_config.eval_every_steps == 0
+        )
+
+        if should_evaluate:
+            last_validation_loss = evaluate_loss(
                 model=model,
                 loader=valid_loader,
                 device=device,
             )
 
             print(
-                f"Шаг {step}/{MAX_STEPS} | "
+                f"Шаг {step}/{training_config.max_steps} | "
                 f"train loss: {loss.item():.4f} | "
-                f"valid loss: {validation_loss:.4f}"
+                f"valid loss: {last_validation_loss:.4f}"
             )
 
-            if validation_loss < best_validation_loss:
-                best_validation_loss = validation_loss
+            if last_validation_loss < best_validation_loss:
+                best_validation_loss = last_validation_loss
 
                 save_checkpoint(
                     path=BEST_CHECKPOINT_PATH,
@@ -208,30 +243,31 @@ def main() -> None:
                     optimizer=optimizer,
                     step=step,
                     train_loss=loss.item(),
-                    validation_loss=validation_loss,
+                    validation_loss=last_validation_loss,
                     config=config,
                 )
 
                 print(
-                    f"Лучшая модель сохранена: "
+                    "Лучшая модель сохранена: "
                     f"{BEST_CHECKPOINT_PATH}"
                 )
 
-        if step % SAVE_EVERY_STEPS == 0:
+        if (
+            step % training_config.save_every_steps == 0
+            or step == training_config.max_steps
+        ):
             save_checkpoint(
                 path=LAST_CHECKPOINT_PATH,
                 model=model,
                 optimizer=optimizer,
                 step=step,
                 train_loss=loss.item(),
-                validation_loss=validation_loss
-                if "validation_loss" in locals()
-                else float("inf"),
+                validation_loss=last_validation_loss,
                 config=config,
             )
 
             print(
-                f"Checkpoint сохранён: "
+                "Checkpoint сохранён: "
                 f"{LAST_CHECKPOINT_PATH}"
             )
 
