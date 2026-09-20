@@ -7,26 +7,56 @@ from assistant.tools import format_search_results, search_web
 
 MODEL_NAME = "qwen3:1.7b"
 MAX_SEARCH_RESULTS = 5
+MAX_HISTORY_MESSAGES = 8
 
 SYSTEM_PROMPT = """
 Ты — ZhenyaAI, полезный личный ассистент Евгения.
 
-Твоя задача:
-- Отвечать на русском языке, если пользователь пишет по-русски.
-- Использовать ТОЛЬКО данные из блока «Результаты веб-поиска».
-- Не выдумывать факты, даты, ссылки или цитаты.
-- Если в результатах недостаточно информации, так и скажи.
-- Сначала дай короткий, понятный ответ.
-- Затем добавь раздел «Источники:» и перечисли только ссылки,
-  которые были переданы в результатах поиска.
-- Не утверждай, что ты сам открыл страницу: у тебя есть только
-  заголовок и фрагмент поисковой выдачи.
+Правила:
+- Учитывай предыдущие сообщения из истории диалога.
+- Если пользователь пишет коротко, например «а как подключиться?»,
+  определи, к чему относится вопрос по истории переписки.
+- Отвечай на русском, когда пользователь пишет на русском.
+- Используй факты только из результатов веб-поиска.
+- Не выдумывай даты, функции, ссылки и инструкции.
+- Если в результатах мало информации, честно скажи об этом.
+- Дай короткий понятный ответ.
+- В конце добавь раздел «Источники:» со ссылками из результатов поиска.
+- Не говори, что ты лично открывал сайты: ты видишь только поисковые фрагменты.
 """.strip()
 
 
-def ask_zhenyaai(question: str) -> str:
+def trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
     """
-    Ищет информацию в интернете и создаёт ответ с помощью Ollama.
+    Оставляет только последние сообщения, чтобы контекст не стал слишком длинным.
+    """
+    return history[-MAX_HISTORY_MESSAGES:]
+
+
+def search_for_question(question: str, history: list[dict[str, str]]) -> str:
+    """
+    Создаёт хороший запрос для поиска с учётом последних сообщений.
+    """
+    previous_user_messages = [
+        item["content"]
+        for item in history
+        if item["role"] == "user"
+    ]
+
+    context = " ".join(previous_user_messages[-2:])
+
+    if context:
+        return f"{context} {question}"
+
+    return question
+
+
+def ask_zhenyaai(
+    question: str,
+    history: list[dict[str, str]],
+) -> str:
+    """
+    Ищет актуальные данные и отвечает через локальную модель Ollama.
     """
 
     question = question.strip()
@@ -34,38 +64,44 @@ def ask_zhenyaai(question: str) -> str:
     if not question:
         raise ValueError("Вопрос не может быть пустым.")
 
+    search_query = search_for_question(question, history)
+
     results = search_web(
-        query=question,
+        query=search_query,
         max_results=MAX_SEARCH_RESULTS,
     )
 
     search_context = format_search_results(results)
 
-    user_prompt = f"""
-Вопрос пользователя:
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
+        *trim_history(history),
+        {
+            "role": "user",
+            "content": f"""
+Текущий вопрос:
 {question}
+
+Поисковый запрос:
+{search_query}
 
 Результаты веб-поиска:
 {search_context}
 
-Составь ответ на вопрос по результатам поиска.
-""".strip()
+Ответь на текущий вопрос, учитывая историю разговора.
+""".strip(),
+        },
+    ]
 
     try:
         client = Client(host="http://127.0.0.1:11434")
 
         response = client.chat(
             model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
+            messages=messages,
             options={
                 "temperature": 0.2,
             },
@@ -76,7 +112,7 @@ def ask_zhenyaai(question: str) -> str:
     except Exception as error:
         raise RuntimeError(
             "Не удалось получить ответ от Ollama. "
-            f"Убедись, что Ollama запущена и скачана модель {MODEL_NAME}."
+            f"Проверь, что Ollama запущена и модель {MODEL_NAME} скачана."
         ) from error
 
     if not answer:
@@ -85,9 +121,11 @@ def ask_zhenyaai(question: str) -> str:
     return answer
 
 
-if __name__ == "__main__":
-    print("ZhenyaAI с веб-поиском запущен.")
-    print("Напиши вопрос. Для выхода введи: выход\n")
+def main() -> None:
+    history: list[dict[str, str]] = []
+
+    print("ZhenyaAI с поиском и контекстной памятью запущен.")
+    print("Команды: /clear — очистить память, выход — закрыть программу.\n")
 
     while True:
         question = input("Ты: ").strip()
@@ -96,13 +134,43 @@ if __name__ == "__main__":
             print("ZhenyaAI: До встречи!")
             break
 
+        if question.lower() == "/clear":
+            history.clear()
+            print("ZhenyaAI: Контекстная память очищена.\n")
+            continue
+
         if not question:
             continue
 
         try:
             print("\nZhenyaAI ищет информацию...\n")
-            answer = ask_zhenyaai(question)
+
+            answer = ask_zhenyaai(
+                question=question,
+                history=history,
+            )
+
             print(f"ZhenyaAI:\n{answer}\n")
+
+            history.append(
+                {
+                    "role": "user",
+                    "content": question,
+                }
+            )
+
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                }
+            )
+
+            history = trim_history(history)
 
         except Exception as error:
             print(f"Ошибка: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
