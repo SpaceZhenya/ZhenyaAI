@@ -17,22 +17,17 @@ RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
 
 TOKENIZER_PATH = PROCESSED_DATA_DIR / "tokenizer.json"
+TOKENIZER_INFO_PATH = PROCESSED_DATA_DIR / "tokenizer_info.json"
 
 TRAIN_TOKENS_PATH = PROCESSED_DATA_DIR / "train_tokens.pt"
 VALID_TOKENS_PATH = PROCESSED_DATA_DIR / "valid_tokens.pt"
 
-VALIDATION_FRACTION = 0.1
+VALIDATION_FRACTION = 0.2
 SPLIT_SEED = 42
 
 
 def read_corpus() -> str:
-    """
-    Читает все TXT-файлы из data/raw.
-    """
-
-    files = sorted(
-        RAW_DATA_DIR.rglob("*.txt")
-    )
+    files = sorted(RAW_DATA_DIR.rglob("*.txt"))
 
     if not files:
         raise FileNotFoundError(
@@ -49,6 +44,7 @@ def read_corpus() -> str:
 
         if text:
             parts.append(text)
+
             print(
                 f"Прочитан файл: {path.name} "
                 f"({len(text):,} символов)"
@@ -63,10 +59,6 @@ def read_corpus() -> str:
 
 
 def load_tokenizer() -> Tokenizer:
-    """
-    Загружает ранее обученный BPE-токенизатор.
-    """
-
     if not TOKENIZER_PATH.exists():
         raise FileNotFoundError(
             "Токенизатор не найден.\n"
@@ -79,12 +71,12 @@ def load_tokenizer() -> Tokenizer:
     )
 
 
-def prepare_token_data() -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Преобразует корпус в ID токенов и делит данные
-    на train и validation.
-    """
+def get_tokenizer_vocab_size() -> int:
+    tokenizer = load_tokenizer()
+    return tokenizer.get_vocab_size()
 
+
+def prepare_token_data() -> tuple[torch.Tensor, torch.Tensor]:
     corpus = read_corpus()
     tokenizer = load_tokenizer()
 
@@ -104,7 +96,7 @@ def prepare_token_data() -> tuple[torch.Tensor, torch.Tensor]:
         eos_id,
     ]
 
-    if len(token_ids) < 3:
+    if len(token_ids) < 20:
         raise ValueError(
             "После токенизации слишком мало токенов."
         )
@@ -116,8 +108,8 @@ def prepare_token_data() -> tuple[torch.Tensor, torch.Tensor]:
     )
 
     split_index = max(
-        2,
-        min(split_index, len(token_ids) - 2),
+        10,
+        min(split_index, len(token_ids) - 10),
     )
 
     train_ids = token_ids[:split_index]
@@ -145,17 +137,11 @@ def prepare_token_data() -> tuple[torch.Tensor, torch.Tensor]:
     print(f"Всего токенов: {len(token_ids):,}")
     print(f"Токенов для обучения: {len(train_tokens):,}")
     print(f"Токенов для проверки: {len(valid_tokens):,}")
-    print(f"Train сохранён: {TRAIN_TOKENS_PATH}")
-    print(f"Validation сохранён: {VALID_TOKENS_PATH}")
 
     return train_tokens, valid_tokens
 
 
 class NextTokenDataset(Dataset):
-    """
-    Датасет для обучения предсказанию следующего токена.
-    """
-
     def __init__(
         self,
         token_ids: torch.Tensor,
@@ -190,16 +176,38 @@ class NextTokenDataset(Dataset):
         return input_ids, targets
 
 
+def choose_context_length(
+    train_tokens: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    requested_length: int,
+) -> int:
+    """
+    Выбирает длину контекста, подходящую обоим наборам.
+    """
+
+    maximum_length = min(
+        len(train_tokens) - 1,
+        len(valid_tokens) - 1,
+    )
+
+    if maximum_length < 8:
+        raise ValueError(
+            "Validation-набор слишком маленький. "
+            "Добавь больше текста в data/raw."
+        )
+
+    return max(
+        8,
+        min(requested_length, maximum_length),
+    )
+
+
 def create_data_loader(
     token_ids: torch.Tensor,
     config: ModelConfig,
     batch_size: int,
     shuffle: bool,
 ) -> DataLoader:
-    """
-    Создаёт DataLoader для выдачи батчей.
-    """
-
     dataset = NextTokenDataset(
         token_ids=token_ids,
         context_length=config.context_length,
@@ -209,7 +217,7 @@ def create_data_loader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        drop_last=True,
+        drop_last=False,
         num_workers=0,
     )
 
@@ -217,46 +225,55 @@ def create_data_loader(
 def main() -> None:
     train_tokens, valid_tokens = prepare_token_data()
 
-    config = ModelConfig(
-        vocab_size=8_000,
-    )
+    vocab_size = get_tokenizer_vocab_size()
 
-    safe_context_length = min(
-        config.context_length,
-        len(train_tokens) - 1,
-        len(valid_tokens) - 1,
+    context_length = choose_context_length(
+        train_tokens=train_tokens,
+        valid_tokens=valid_tokens,
+        requested_length=256,
     )
-
-    if safe_context_length < 8:
-        raise ValueError(
-            "Корпус слишком маленький. "
-            "Добавь больше текста в data/raw."
-        )
 
     config = ModelConfig(
-        vocab_size=config.vocab_size,
-        context_length=safe_context_length,
-        embedding_dim=config.embedding_dim,
-        num_layers=config.num_layers,
-        num_heads=config.num_heads,
-        dropout=config.dropout,
+        vocab_size=vocab_size,
+        context_length=context_length,
     )
 
-    loader = create_data_loader(
+    train_loader = create_data_loader(
         token_ids=train_tokens,
         config=config,
         batch_size=2,
         shuffle=False,
     )
 
-    input_ids, targets = next(iter(loader))
+    valid_loader = create_data_loader(
+        token_ids=valid_tokens,
+        config=config,
+        batch_size=2,
+        shuffle=False,
+    )
+
+    train_input_ids, train_targets = next(iter(train_loader))
+    valid_input_ids, valid_targets = next(iter(valid_loader))
 
     print("\nТест DataLoader:")
+    print(f"Размер словаря: {config.vocab_size}")
     print(f"Context length: {config.context_length}")
-    print(f"Форма input_ids: {tuple(input_ids.shape)}")
-    print(f"Форма targets: {tuple(targets.shape)}")
-    print(f"Первые токены входа: {input_ids[0, :10].tolist()}")
-    print(f"Первые токены цели: {targets[0, :10].tolist()}")
+    print(
+        f"Train input_ids: "
+        f"{tuple(train_input_ids.shape)}"
+    )
+    print(
+        f"Train targets: "
+        f"{tuple(train_targets.shape)}"
+    )
+    print(
+        f"Valid input_ids: "
+        f"{tuple(valid_input_ids.shape)}"
+    )
+    print(
+        f"Valid targets: "
+        f"{tuple(valid_targets.shape)}"
+    )
 
 
 if __name__ == "__main__":
