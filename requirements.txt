@@ -1,2 +1,2 @@
 ollama
-duckduckgo-search
+ddgs
