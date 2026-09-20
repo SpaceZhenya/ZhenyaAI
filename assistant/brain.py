@@ -1,62 +1,50 @@
 from __future__ import annotations
 
-from ollama import Client
-
-from assistant.tools import format_search_results, search_web
-
-
-MODEL_NAME = "qwen3:1.7b"
-MAX_SEARCH_RESULTS = 5
-MAX_HISTORY_MESSAGES = 8
-
-SYSTEM_PROMPT = """
-Ты — ZhenyaAI, полезный личный ассистент Евгения.
-
-Правила:
-- Учитывай предыдущие сообщения из истории диалога.
-- Если пользователь пишет коротко, например «а как подключиться?»,
-  определи, к чему относится вопрос по истории переписки.
-- Отвечай на русском, когда пользователь пишет на русском.
-- Используй факты только из результатов веб-поиска.
-- Не выдумывай даты, функции, ссылки и инструкции.
-- Если в результатах мало информации, честно скажи об этом.
-- Дай короткий понятный ответ.
-- В конце добавь раздел «Источники:» со ссылками из результатов поиска.
-- Не говори, что ты лично открывал сайты: ты видишь только поисковые фрагменты.
-""".strip()
+from assistant.summarizer import summarize
+from assistant.tools import SearchResult, search_web
 
 
-def trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
+MAX_SEARCH_RESULTS = 6
+SUMMARY_SENTENCES = 4
+
+
+def build_source_list(results: list[SearchResult]) -> str:
     """
-    Оставляет только последние сообщения, чтобы контекст не стал слишком длинным.
+    Создаёт список ссылок на источники.
     """
-    return history[-MAX_HISTORY_MESSAGES:]
+
+    if not results:
+        return "Источники не найдены."
+
+    lines = []
+
+    for number, result in enumerate(results, start=1):
+        lines.append(f"{number}. {result.title}\n{result.url}")
+
+    return "\n".join(lines)
 
 
-def search_for_question(question: str, history: list[dict[str, str]]) -> str:
+def build_search_text(results: list[SearchResult]) -> str:
     """
-    Создаёт хороший запрос для поиска с учётом последних сообщений.
+    Объединяет заголовки и фрагменты поисковой выдачи в один текст.
     """
-    previous_user_messages = [
-        item["content"]
-        for item in history
-        if item["role"] == "user"
-    ]
 
-    context = " ".join(previous_user_messages[-2:])
+    blocks = []
 
-    if context:
-        return f"{context} {question}"
+    for result in results:
+        if result.title:
+            blocks.append(result.title)
 
-    return question
+        if result.snippet:
+            blocks.append(result.snippet)
+
+    return "\n".join(blocks)
 
 
-def ask_zhenyaai(
-    question: str,
-    history: list[dict[str, str]],
-) -> str:
+def ask_zhenyaai(question: str) -> str:
     """
-    Ищет актуальные данные и отвечает через локальную модель Ollama.
+    Ищет информацию и делает локальное краткое резюме
+    без Ollama и без внешней языковой модели.
     """
 
     question = question.strip()
@@ -64,68 +52,37 @@ def ask_zhenyaai(
     if not question:
         raise ValueError("Вопрос не может быть пустым.")
 
-    search_query = search_for_question(question, history)
-
     results = search_web(
-        query=search_query,
+        query=question,
         max_results=MAX_SEARCH_RESULTS,
     )
 
-    search_context = format_search_results(results)
-
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        },
-        *trim_history(history),
-        {
-            "role": "user",
-            "content": f"""
-Текущий вопрос:
-{question}
-
-Поисковый запрос:
-{search_query}
-
-Результаты веб-поиска:
-{search_context}
-
-Ответь на текущий вопрос, учитывая историю разговора.
-""".strip(),
-        },
-    ]
-
-    try:
-        client = Client(host="http://127.0.0.1:11434")
-
-        response = client.chat(
-            model=MODEL_NAME,
-            messages=messages,
-            options={
-                "temperature": 0.2,
-            },
+    if not results:
+        return (
+            "Я не нашёл результатов по этому запросу. "
+            "Попробуй написать вопрос более конкретно."
         )
 
-        answer = response["message"]["content"].strip()
+    search_text = build_search_text(results)
 
-    except Exception as error:
-        raise RuntimeError(
-            "Не удалось получить ответ от Ollama. "
-            f"Проверь, что Ollama запущена и модель {MODEL_NAME} скачана."
-        ) from error
+    summary = summarize(
+        text=search_text,
+        max_sentences=SUMMARY_SENTENCES,
+    )
 
-    if not answer:
-        raise RuntimeError("Ollama вернула пустой ответ.")
+    sources = build_source_list(results)
 
-    return answer
+    return (
+        f"Краткий ответ по запросу «{question}»:\n\n"
+        f"{summary}\n\n"
+        f"Источники:\n{sources}"
+    )
 
 
 def main() -> None:
-    history: list[dict[str, str]] = []
-
-    print("ZhenyaAI с поиском и контекстной памятью запущен.")
-    print("Команды: /clear — очистить память, выход — закрыть программу.\n")
+    print("ZhenyaAI запущен.")
+    print("Режим: поиск и собственная суммаризация.")
+    print("Для выхода введи: выход\n")
 
     while True:
         question = input("Ты: ").strip()
@@ -134,39 +91,15 @@ def main() -> None:
             print("ZhenyaAI: До встречи!")
             break
 
-        if question.lower() == "/clear":
-            history.clear()
-            print("ZhenyaAI: Контекстная память очищена.\n")
-            continue
-
         if not question:
             continue
 
         try:
-            print("\nZhenyaAI ищет информацию...\n")
+            print("\nZhenyaAI ищет информацию и делает краткое резюме...\n")
 
-            answer = ask_zhenyaai(
-                question=question,
-                history=history,
-            )
+            answer = ask_zhenyaai(question)
 
             print(f"ZhenyaAI:\n{answer}\n")
-
-            history.append(
-                {
-                    "role": "user",
-                    "content": question,
-                }
-            )
-
-            history.append(
-                {
-                    "role": "assistant",
-                    "content": answer,
-                }
-            )
-
-            history = trim_history(history)
 
         except Exception as error:
             print(f"Ошибка: {error}\n")
