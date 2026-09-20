@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import random
 
@@ -36,6 +37,17 @@ def get_device() -> torch.device:
         return torch.device("cuda")
 
     return torch.device("cpu")
+
+
+def safe_perplexity(loss: float) -> float:
+    """
+    Вычисляет perplexity и защищает от переполнения.
+    """
+
+    if not math.isfinite(loss):
+        return float("inf")
+
+    return math.exp(min(loss, 20.0))
 
 
 def evaluate_loss(
@@ -204,7 +216,7 @@ def main() -> None:
 
         if loss is None:
             raise RuntimeError(
-                "Модель не вернула значение loss."
+                "Модель не вернула loss."
             )
 
         loss.backward()
@@ -228,10 +240,20 @@ def main() -> None:
                 device=device,
             )
 
+            train_loss_value = loss.item()
+            train_ppl = safe_perplexity(
+                train_loss_value
+            )
+            valid_ppl = safe_perplexity(
+                last_validation_loss
+            )
+
             print(
                 f"Шаг {step}/{training_config.max_steps} | "
-                f"train loss: {loss.item():.4f} | "
-                f"valid loss: {last_validation_loss:.4f}"
+                f"train loss: {train_loss_value:.4f} | "
+                f"train PPL: {train_ppl:.2f} | "
+                f"valid loss: {last_validation_loss:.4f} | "
+                f"valid PPL: {valid_ppl:.2f}"
             )
 
             if last_validation_loss < best_validation_loss:
@@ -242,7 +264,7 @@ def main() -> None:
                     model=model,
                     optimizer=optimizer,
                     step=step,
-                    train_loss=loss.item(),
+                    train_loss=train_loss_value,
                     validation_loss=last_validation_loss,
                     config=config,
                 )
