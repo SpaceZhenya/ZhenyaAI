@@ -21,9 +21,9 @@ STATS_PATH = SPLITS_DIR / "corpus_stats.json"
 
 MIN_CHARACTERS = 200
 
-TRAIN_FRACTION = 0.90
-VALIDATION_FRACTION = 0.05
-TEST_FRACTION = 0.05
+TRAIN_FRACTION = 0.80
+VALIDATION_FRACTION = 0.10
+TEST_FRACTION = 0.10
 
 SEED = 42
 
@@ -35,17 +35,24 @@ class CorpusStats:
     duplicate_documents: int
     rejected_documents: int
     total_characters: int
+    train_documents: int
+    validation_documents: int
+    test_documents: int
     train_characters: int
     validation_characters: int
     test_characters: int
 
 
 def normalize_text(text: str) -> str:
+    """
+    Убирает технический мусор, лишние пробелы и пустые строки.
+    """
+
     text = text.replace("\ufeff", "")
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
 
-    lines = []
+    lines: list[str] = []
 
     for line in text.split("\n"):
         line = re.sub(r"[ \t]+", " ", line).strip()
@@ -61,30 +68,33 @@ def normalize_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def load_documents() -> tuple[list[str], CorpusStats]:
+def load_documents() -> tuple[list[str], int, int, int]:
+    """
+    Находит и очищает все TXT-файлы в data/raw/imported.
+    """
+
     RAW_IMPORTED_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    files = sorted(
+    paths = sorted(
         RAW_IMPORTED_DIR.rglob("*.txt")
     )
 
-    if not files:
+    if not paths:
         raise FileNotFoundError(
-            "Нет файлов для подготовки корпуса.\n"
-            "Добавь TXT-файлы в:\n"
-            "data/raw/imported/"
+            "В папке data/raw/imported нет TXT-файлов.\n"
+            "Добавь минимум 10 отдельных текстов."
         )
 
     documents: list[str] = []
-    hashes: set[str] = set()
+    document_hashes: set[str] = set()
 
     duplicates = 0
     rejected = 0
 
-    for path in files:
+    for path in paths:
         raw_text = path.read_text(
             encoding="utf-8",
             errors="replace",
@@ -99,106 +109,136 @@ def load_documents() -> tuple[list[str], CorpusStats]:
             )
             continue
 
-        document_hash = sha256(
+        text_hash = sha256(
             text.encode("utf-8")
         ).hexdigest()
 
-        if document_hash in hashes:
+        if text_hash in document_hashes:
             duplicates += 1
             print(
                 f"Пропущен дубликат: {path.name}"
             )
             continue
 
-        hashes.add(document_hash)
+        document_hashes.add(text_hash)
         documents.append(text)
 
         print(
-            f"Добавлен файл: {path.name} "
+            f"Добавлен: {path.name} "
             f"({len(text):,} символов)"
         )
 
-    stats = CorpusStats(
-        found_files=len(files),
-        accepted_documents=len(documents),
-        duplicate_documents=duplicates,
-        rejected_documents=rejected,
-        total_characters=sum(
-            len(document)
-            for document in documents
-        ),
-        train_characters=0,
-        validation_characters=0,
-        test_characters=0,
-    )
-
     if not documents:
         raise ValueError(
-            "Нет подходящих документов после очистки."
+            "После очистки не осталось подходящих текстов."
         )
 
-    return documents, stats
+    return documents, len(paths), duplicates, rejected
 
 
 def split_documents(
     documents: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
-    if len(documents) < 3:
+    """
+    Делит документы на train, validation и test.
+    """
+
+    if len(documents) < 10:
         raise ValueError(
-            "Нужно минимум 3 документа: "
-            "для train, validation и test."
+            "Нужно минимум 10 отдельных документов.\n"
+            "Сейчас добавь больше TXT-файлов в "
+            "data/raw/imported."
         )
 
-    random.Random(SEED).shuffle(documents)
+    shuffled = documents.copy()
 
-    total = len(documents)
+    random.Random(SEED).shuffle(
+        shuffled
+    )
 
-    train_end = max(
+    total = len(shuffled)
+
+    train_count = max(
         1,
         int(total * TRAIN_FRACTION),
     )
 
-    validation_end = max(
-        train_end + 1,
-        int(total * (TRAIN_FRACTION + VALIDATION_FRACTION)),
+    validation_count = max(
+        1,
+        int(total * VALIDATION_FRACTION),
     )
 
-    validation_end = min(
-        validation_end,
-        total - 1,
-    )
+    remaining = total - train_count - validation_count
 
-    train = documents[:train_end]
-    validation = documents[
-        train_end:validation_end
+    if remaining < 1:
+        train_count = total - 2
+        validation_count = 1
+        remaining = 1
+
+    train_documents = shuffled[:train_count]
+
+    validation_documents = shuffled[
+        train_count:train_count + validation_count
     ]
-    test = documents[validation_end:]
 
-    if not validation or not test:
-        raise ValueError(
-            "Недостаточно документов для разделения. "
-            "Добавь больше отдельных TXT-файлов."
-        )
+    test_documents = shuffled[
+        train_count + validation_count:
+    ]
 
-    return train, validation, test
+    return (
+        train_documents,
+        validation_documents,
+        test_documents,
+    )
 
 
-def save_split(
+def save_documents(
     path: Path,
     documents: list[str],
 ) -> int:
+    """
+    Сохраняет документы. <eos> отмечает границу текста.
+    """
+
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    text = "\n\n<eos>\n\n".join(documents)
+    combined_text = "\n\n<eos>\n\n".join(
+        documents
+    )
+
     path.write_text(
-        text,
+        combined_text,
         encoding="utf-8",
     )
 
-    return len(text)
+    return len(combined_text)
+
+
+def save_cleaned_documents(
+    documents: list[str],
+) -> None:
+    """
+    Сохраняет очищенные документы отдельно.
+    """
+
+    CLEANED_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    for index, document in enumerate(
+        documents,
+        start=1,
+    ):
+        path = CLEANED_DIR / f"document_{index:05d}.txt"
+
+        path.write_text(
+            document,
+            encoding="utf-8",
+        )
 
 
 def save_stats(stats: CorpusStats) -> None:
@@ -222,53 +262,82 @@ def save_stats(stats: CorpusStats) -> None:
 def main() -> None:
     print("Подготовка корпуса ZhenyaAI...\n")
 
-    documents, stats = load_documents()
+    documents, found_files, duplicates, rejected = (
+        load_documents()
+    )
+
+    save_cleaned_documents(documents)
 
     train, validation, test = split_documents(
         documents
     )
 
-    train_characters = save_split(
+    train_characters = save_documents(
         TRAIN_PATH,
         train,
     )
 
-    validation_characters = save_split(
+    validation_characters = save_documents(
         VALIDATION_PATH,
         validation,
     )
 
-    test_characters = save_split(
+    test_characters = save_documents(
         TEST_PATH,
         test,
     )
 
-    stats.train_characters = train_characters
-    stats.validation_characters = validation_characters
-    stats.test_characters = test_characters
+    stats = CorpusStats(
+        found_files=found_files,
+        accepted_documents=len(documents),
+        duplicate_documents=duplicates,
+        rejected_documents=rejected,
+        total_characters=sum(
+            len(document)
+            for document in documents
+        ),
+        train_documents=len(train),
+        validation_documents=len(validation),
+        test_documents=len(test),
+        train_characters=train_characters,
+        validation_characters=validation_characters,
+        test_characters=test_characters,
+    )
 
     save_stats(stats)
 
-    print("\nКорпус подготовлен.")
+    print("\nКорпус готов.")
+    print(f"Файлов найдено: {stats.found_files}")
     print(
         f"Документов принято: "
         f"{stats.accepted_documents}"
+    )
+    print(
+        f"Дубликатов пропущено: "
+        f"{stats.duplicate_documents}"
+    )
+    print(
+        f"Коротких файлов пропущено: "
+        f"{stats.rejected_documents}"
     )
     print(
         f"Всего символов: "
         f"{stats.total_characters:,}"
     )
     print(
-        f"Train: {train_characters:,} символов"
+        f"Train: {stats.train_documents} документов, "
+        f"{stats.train_characters:,} символов"
     )
     print(
         f"Validation: "
-        f"{validation_characters:,} символов"
+        f"{stats.validation_documents} документов, "
+        f"{stats.validation_characters:,} символов"
     )
     print(
-        f"Test: {test_characters:,} символов"
+        f"Test: {stats.test_documents} документов, "
+        f"{stats.test_characters:,} символов"
     )
-    print(f"\nФайлы сохранены в: {SPLITS_DIR}")
+    print(f"\nСтатистика: {STATS_PATH}")
 
 
 if __name__ == "__main__":
