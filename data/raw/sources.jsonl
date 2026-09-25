@@ -1,0 +1,3 @@
+{"file":"imported/own_notes.txt","source":"Собственные тексты Евгения","license":"own-work","language":"ru","purpose":"pretraining"}
+{"file":"imported/own_dialogs.txt","source":"Собственные примеры диалогов ZhenyaAI","license":"own-work","language":"ru","purpose":"instruction-tuning"}
+{"file":"imported/public_domain.txt","source":"Тексты общественного достояния","license":"public-domain","language":"ru","purpose":"pretraining"}
